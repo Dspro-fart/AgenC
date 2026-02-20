@@ -68,6 +68,7 @@ circuits/**/*.gz
 .codex/
 CODEX.md
 codex.md
+AGENTS.md
 
 # Cursor IDE
 .cursor/
