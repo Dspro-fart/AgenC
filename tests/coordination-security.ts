@@ -805,10 +805,19 @@ describe("coordination-security", () => {
         }
 
         const dispute = await program.account.dispute.fetch(disputePda);
-        // Votes are stake-weighted by reputation (default 5000 = 50% weight).
-        const expectedVoteWeight = Math.floor(LAMPORTS_PER_SOL / 2);
+        // Vote weight is capped at 10x min arbiter stake and then scaled by reputation.
+        const protocolConfig = await program.account.protocolConfig.fetch(protocolPda);
+        const arbiter1State = await program.account.agentRegistration.fetch(
+          deriveAgentPda(arbiterId1, program.programId)
+        );
+        const maxVoteWeight = protocolConfig.minArbiterStake.toNumber() * 10;
+        const cappedStake = Math.min(arbiter1State.stake.toNumber(), maxVoteWeight);
+        const expectedVoteWeight = Math.max(
+          1,
+          Math.floor((cappedStake * arbiter1State.reputation) / 10000)
+        );
         expect(dispute.votesFor.toNumber()).to.equal(2 * expectedVoteWeight);
-        expect(dispute.votesAgainst.toNumber()).to.equal(1 * expectedVoteWeight);
+        expect(dispute.votesAgainst.toNumber()).to.equal(expectedVoteWeight);
         expect(dispute.totalVoters).to.equal(3);
       });
 
