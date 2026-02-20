@@ -28,11 +28,6 @@
 ## Testing Guidelines
 - Unit tests are co-located as `*.test.ts` (primarily under `runtime/src/**` and `sdk/src/**`, run via Vitest).
 - Root `tests/*.ts` covers protocol/integration behavior with LiteSVM and Anchor test utilities.
-- Default local loop: run `npm run test:fast` first (LiteSVM path, fast feedback).
-- For validator-only coverage, run targeted files instead of the full suite, for example:
-  `ANCHOR_PROVIDER_URL=http://127.0.0.1:8899 ANCHOR_WALLET=$HOME/.config/solana/id.json npx ts-mocha -p ./tsconfig.json -t 1000000 tests/<file>.ts`
-- Preferred stable validator runner: `npm run test:anchor:stable` (sequential + retry for transient RPC failures).
-- Reserve `npm run test:anchor` for final pre-merge confidence checks because it is much slower.
 - Add or update regression tests with behavior changes; run `npm run test:fast && npm run typecheck` before opening a PR.
 
 ## Commit & Pull Request Guidelines
