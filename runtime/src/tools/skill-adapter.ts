@@ -223,6 +223,7 @@ export const PUMPTRACKS_ACTION_SCHEMAS: ActionSchemaMap = {
       twitter: { type: 'string', description: 'Optional X/Twitter URL' },
       tiktok: { type: 'string', description: 'Optional TikTok URL' },
       instagram: { type: 'string', description: 'Optional Instagram URL' },
+      initialBuyLamports: { type: 'number', description: 'Optional initial buy amount in lamports (default: 50_000_000 = 0.05 SOL)' },
     },
     required: ['audio', 'artwork', 'title', 'artist', 'genre'],
   },

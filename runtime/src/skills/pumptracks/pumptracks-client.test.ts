@@ -202,23 +202,16 @@ describe('PumpTracksClient', () => {
     });
   });
 
-  // ── prepareMint ──
+  // ── uploadFiles ──
 
-  describe('prepareMint', () => {
-    it('sends FormData and returns prepare result', async () => {
+  describe('uploadFiles', () => {
+    it('sends FormData and returns upload result (URIs only, no transactions)', async () => {
       const mockResult = {
-        transactions: ['base64tx1'],
-        mint: 'mintAddress',
-        trackInfo: {
-          title: 'Test',
-          artist: 'Artist',
-          genre: 'Electronic',
-          symbol: 'TEST',
-          metadataUri: 'ipfs://Qm...',
-          artUri: 'https://storage.googleapis.com/...',
-          trackUri: 'https://storage.googleapis.com/...',
-          wallet: 'walletAddress',
-        },
+        metadataUri: 'ipfs://QmTest123',
+        artUri: 'https://storage.googleapis.com/art.jpg',
+        trackUri: 'https://storage.googleapis.com/track.mp3',
+        symbol: 'TEST',
+        platformId: 'EjET1WnDdcqb2vBsAJ6Kdq4mKCTSvzrGHUVhKpEX7K4Q',
       };
 
       (globalThis.fetch as any).mockResolvedValueOnce({
@@ -229,19 +222,41 @@ describe('PumpTracksClient', () => {
       const formData = new FormData();
       formData.append('title', 'Test');
 
-      const result = await client.prepareMint(formData);
-      expect(result.transactions).toHaveLength(1);
-      expect(result.mint).toBe('mintAddress');
+      const result = await client.uploadFiles(formData);
+      expect(result.metadataUri).toBe('ipfs://QmTest123');
+      expect(result.symbol).toBe('TEST');
+      expect(result.platformId).toBeDefined();
+      // Upload result must NEVER contain transactions
+      expect((result as any).transactions).toBeUndefined();
+      expect((result as any).mint).toBeUndefined();
     });
 
-    it('throws on prepare failure', async () => {
+    it('sends to /tracks/upload endpoint', async () => {
+      (globalThis.fetch as any).mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({
+          success: true,
+          data: {
+            metadataUri: 'ipfs://x', artUri: 'https://a',
+            trackUri: 'https://t', symbol: 'S', platformId: 'p',
+          },
+        }),
+      });
+
+      await client.uploadFiles(new FormData());
+
+      const calledUrl = (globalThis.fetch as any).mock.calls[0][0];
+      expect(calledUrl).toContain('/tracks/upload');
+    });
+
+    it('throws on upload failure', async () => {
       (globalThis.fetch as any).mockResolvedValueOnce({
         ok: false,
         status: 400,
         text: () => Promise.resolve('Missing required fields'),
       });
 
-      await expect(client.prepareMint(new FormData())).rejects.toThrow(PumpTracksApiError);
+      await expect(client.uploadFiles(new FormData())).rejects.toThrow(PumpTracksApiError);
     });
   });
 

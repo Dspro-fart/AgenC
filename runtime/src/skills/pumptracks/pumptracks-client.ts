@@ -13,7 +13,8 @@ import type {
   SearchTracksParams,
   Track,
   Artist,
-  PrepareResult,
+  UploadResult,
+  TrackInfo,
   MintResult,
   ApiResponse,
 } from './types.js';
@@ -124,15 +125,18 @@ export class PumpTracksClient {
   }
 
   /**
-   * Prepare a mint: upload files, build unsigned transaction.
+   * Upload audio + artwork to PumpTracks for hosting.
    *
-   * @param formData - FormData with audio, artwork, title, artist, genre, wallet
-   * @returns Unsigned transactions + mint address + track info
+   * Returns file URIs only — NO transactions, NO mint keypairs.
+   * The agent is responsible for building its own Raydium transaction.
+   *
+   * @param formData - FormData with audio, artwork, title, artist, genre, wallet, mint
+   * @returns File URIs (metadataUri, artUri, trackUri, symbol, platformId)
    */
-  async prepareMint(formData: FormData): Promise<PrepareResult> {
-    this.logger.debug('PumpTracks: preparing mint...');
+  async uploadFiles(formData: FormData): Promise<UploadResult> {
+    this.logger.debug('PumpTracks: uploading files...');
 
-    const response = await this.fetchWithTimeout(`${this.apiBaseUrl}/tracks/mint`, {
+    const response = await this.fetchWithTimeout(`${this.apiBaseUrl}/tracks/upload`, {
       method: 'POST',
       headers: { 'X-API-Key': this.apiKey },
       body: formData,
@@ -141,17 +145,17 @@ export class PumpTracksClient {
     if (!response.ok) {
       const body = await response.text().catch(() => 'unknown');
       throw new PumpTracksApiError(
-        `Prepare mint failed (${response.status}): ${body}`,
-        '/tracks/mint',
+        `Upload failed (${response.status}): ${body}`,
+        '/tracks/upload',
         response.status,
       );
     }
 
-    const result = await response.json() as ApiResponse<PrepareResult>;
+    const result = await response.json() as ApiResponse<UploadResult>;
     if (!result.success || !result.data) {
       throw new PumpTracksApiError(
-        result.error || 'Prepare mint returned no data',
-        '/tracks/mint',
+        result.error || 'Upload returned no data',
+        '/tracks/upload',
       );
     }
 
@@ -174,7 +178,7 @@ export class PumpTracksClient {
   async registerTrack(
     mint: string,
     txIds: string[],
-    trackInfo: PrepareResult['trackInfo'],
+    trackInfo: TrackInfo,
   ): Promise<MintResult> {
     this.logger.debug('PumpTracks: registering track...');
 

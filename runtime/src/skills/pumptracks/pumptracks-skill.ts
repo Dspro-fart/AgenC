@@ -2,11 +2,13 @@
  * PumpTracks music token skill implementation.
  *
  * Provides track browsing, searching, artist lookup, and full
- * music token minting via the PumpTracks API + Raydium LaunchLab.
+ * music token minting via the Raydium LaunchLab SDK.
  *
  * Security:
- * - Transaction instruction validation against program ID allowlist
- * - Transaction simulation before signing
+ * - The agent builds its own Raydium transaction locally — NO external
+ *   server ever provides transaction bytes for signing
+ * - PumpTracks is used ONLY for file uploads (audio/artwork/IPFS) and
+ *   track registration (saving metadata after on-chain confirmation)
  * - File path traversal protection with blocked-path patterns
  * - SOL balance guard before minting
  *
@@ -14,18 +16,28 @@
  */
 
 import {
+  Keypair,
   LAMPORTS_PER_SOL,
-  VersionedTransaction,
+  PublicKey,
 } from '@solana/web3.js';
 import type { Connection } from '@solana/web3.js';
+import {
+  Raydium,
+  TxVersion,
+  LAUNCHPAD_PROGRAM,
+  getPdaLaunchpadConfigId,
+  LaunchpadConfig,
+} from '@raydium-io/raydium-sdk-v2';
+import { NATIVE_MINT } from '@solana/spl-token';
+import BN from 'bn.js';
 import type { Skill, SkillMetadata, SkillAction, SkillContext, SemanticVersion } from '../types.js';
 import { SkillState } from '../types.js';
 import { SkillNotReadyError } from '../errors.js';
 import { PumpTracksClient } from './pumptracks-client.js';
 import {
   PUMPTRACKS_API_BASE_URL,
+  PUMPTRACKS_PLATFORM_ID,
   DEFAULT_TIMEOUT_MS,
-  ALLOWED_PROGRAM_IDS,
   ALLOWED_AUDIO_EXTENSIONS,
   ALLOWED_IMAGE_EXTENSIONS,
   MAX_AUDIO_SIZE,
@@ -58,7 +70,7 @@ const VERSION: SemanticVersion = '0.1.0';
  * - `getTrack`     — Get a single track by mint address
  * - `searchTracks` — Search tracks by title, artist, or symbol
  * - `getArtist`    — Get artist profile and their tracks
- * - `mintTrack`    — Full end-to-end mint: upload files, sign, broadcast to Solana, register
+ * - `mintTrack`    — Full end-to-end mint: upload files, build tx locally, broadcast to Solana
  *
  * @example
  * ```typescript
@@ -138,7 +150,7 @@ export class PumpTracksSkill implements Skill {
       },
       {
         name: 'mintTrack',
-        description: 'Mint a new music token on PumpTracks. Uploads audio + artwork, validates the returned transaction against a program allowlist, simulates it, signs it, and broadcasts directly to Solana. Signed transactions never leave the agent. Requires ~0.07 SOL.',
+        description: 'Mint a new music token on PumpTracks. The agent generates its own mint keypair, uploads files to PumpTracks for hosting, then builds and signs the Raydium LaunchLab transaction LOCALLY using the SDK. No external server ever provides transaction bytes. Requires ~0.07 SOL.',
         execute: (params: unknown) => this.mintTrack(params as MintTrackParams),
       },
     ];
@@ -188,61 +200,43 @@ export class PumpTracksSkill implements Skill {
   // Typed action methods
   // ============================================================================
 
-  /**
-   * List tracks with optional filters.
-   */
   async getTracks(params?: ListTracksParams): Promise<Track[]> {
     this.ensureReady();
     return this.client!.listTracks(params);
   }
 
-  /**
-   * Get a single track by mint address.
-   */
   async getTrack(mint: string): Promise<Track> {
     this.ensureReady();
     return this.client!.getTrack(mint);
   }
 
-  /**
-   * Search tracks by title, artist, or symbol.
-   */
   async searchTracks(params: SearchTracksParams): Promise<Track[]> {
     this.ensureReady();
     return this.client!.searchTracks(params);
   }
 
-  /**
-   * Get artist profile by wallet address.
-   */
   async getArtist(wallet: string): Promise<Artist> {
     this.ensureReady();
     return this.client!.getArtist(wallet);
   }
 
   /**
-   * Full end-to-end mint flow with security validation:
+   * Full end-to-end mint flow — the agent builds its own transaction:
    *
    * 1. Validate file paths (no traversal, no sensitive files)
    * 2. Check SOL balance (must have >= 0.07 SOL)
-   * 3. Upload audio + artwork to PumpTracks API (prepare step)
-   * 4. Receive unsigned Raydium LaunchLab transaction
-   * 5. Validate every instruction's program ID against allowlist
-   * 6. Simulate transaction before signing
-   * 7. Sign with the agent's wallet
-   * 8. Broadcast directly to Solana RPC (NOT back to PumpTracks)
-   * 9. Wait for on-chain confirmation
-   * 10. Register track on PumpTracks (mint address + tx IDs only, no signed txs)
+   * 3. Generate mint keypair LOCALLY (agent controls the mint)
+   * 4. Upload files to PumpTracks for hosting (files only, no transactions)
+   * 5. Build Raydium LaunchLab transaction LOCALLY using the SDK
+   * 6. Sign with the agent's wallet + mint keypair
+   * 7. Broadcast directly to Solana
+   * 8. Register track on PumpTracks (mint address + tx IDs only)
    *
-   * The agent NEVER sends signed transactions to any external server.
-   * Signed transactions go directly to the Solana network.
+   * PumpTracks NEVER sees, builds, or touches any transaction.
+   * The agent is in full control of what it signs because it built
+   * the transaction itself using the Raydium SDK.
    *
    * @returns Mint address, tx IDs, and play URL
-   * @throws Error if transaction contains disallowed programs
-   * @throws Error if simulation fails
-   * @throws Error if insufficient SOL balance
-   * @throws Error if file path is blocked or invalid
-   * @throws Error if on-chain broadcast or confirmation fails
    */
   async mintTrack(params: MintTrackParams): Promise<MintResult> {
     this.ensureReady();
@@ -256,7 +250,16 @@ export class PumpTracksSkill implements Skill {
     // ── Security: Check SOL balance ──
     await this.ensureSufficientBalance();
 
-    // ── Step 1: Build form data ──
+    // ── Step 1: Generate mint keypair LOCALLY ──
+    // The agent controls this keypair — PumpTracks never sees the secret key.
+    const mintKeypair = Keypair.generate();
+    const mintAddress = mintKeypair.publicKey.toBase58();
+    this.logger!.info(`PumpTracks: generated mint keypair locally: ${mintAddress}`);
+
+    // ── Step 2: Upload files to PumpTracks (files only, NO transactions) ──
+    // PumpTracks handles Firebase Storage + IPFS hosting.
+    // It returns URIs — never transaction bytes.
+    this.logger!.info('PumpTracks: uploading files...');
     const formData = new FormData();
     formData.append('audio', audioBlob, audioFilename);
     formData.append('artwork', artBlob, artFilename);
@@ -264,166 +267,102 @@ export class PumpTracksSkill implements Skill {
     formData.append('artist', params.artist);
     formData.append('genre', params.genre);
     formData.append('wallet', walletAddress);
+    formData.append('mint', mintAddress);
     if (params.twitter) formData.append('twitter', params.twitter);
     if (params.tiktok) formData.append('tiktok', params.tiktok);
     if (params.instagram) formData.append('instagram', params.instagram);
 
-    // ── Step 2: Prepare mint (upload files + build unsigned tx) ──
-    this.logger!.info('PumpTracks: uploading files and preparing transaction...');
-    const prepared = await this.client!.prepareMint(formData);
+    const uploadResult = await this.client!.uploadFiles(formData);
+    this.logger!.info(`PumpTracks: files uploaded, metadataUri = ${uploadResult.metadataUri}`);
 
-    this.logger!.info(`PumpTracks: mint address = ${prepared.mint}`);
-    this.logger!.info(`PumpTracks: ${prepared.transactions.length} transaction(s) to sign`);
+    // ── Step 3: Build Raydium LaunchLab transaction LOCALLY ──
+    // The agent uses the Raydium SDK directly. No external server
+    // provides transaction bytes — we build them ourselves.
+    this.logger!.info('PumpTracks: building Raydium transaction locally...');
 
-    // ── Step 3: Validate, simulate, and sign each transaction ──
-    this.logger!.info('PumpTracks: validating and signing transactions...');
-    const signedTransactions: VersionedTransaction[] = [];
-
-    for (let i = 0; i < prepared.transactions.length; i++) {
-      const txBytes = Buffer.from(prepared.transactions[i], 'base64');
-      const tx = VersionedTransaction.deserialize(txBytes);
-
-      // Security: Validate all program IDs against allowlist
-      this.validateTransactionPrograms(tx, i);
-
-      // Security: Simulate before signing
-      await this.simulateTransaction(tx, i);
-
-      // Sign
-      const signedTx = await this.wallet!.signTransaction(tx);
-      signedTransactions.push(signedTx);
-      this.logger!.debug(`PumpTracks: signed transaction ${i + 1}/${prepared.transactions.length}`);
-    }
-
-    // ── Step 4: Broadcast directly to Solana (NOT to PumpTracks) ──
-    // Signed transactions NEVER leave the agent — they go straight to
-    // the Solana network via the agent's own RPC connection.
-    this.logger!.info('PumpTracks: broadcasting directly to Solana...');
-    const txIds: string[] = [];
-
-    for (let i = 0; i < signedTransactions.length; i++) {
-      const signedTx = signedTransactions[i];
-      const rawTx = signedTx.serialize();
-
-      const txId = await this.connection!.sendRawTransaction(rawTx, {
-        skipPreflight: false,
-        maxRetries: 3,
-      });
-      this.logger!.debug(`PumpTracks: broadcast transaction ${i + 1}: ${txId}`);
-      txIds.push(txId);
-
-      // Wait for confirmation
-      const { blockhash, lastValidBlockHeight } =
-        await this.connection!.getLatestBlockhash();
-      const confirmation = await this.connection!.confirmTransaction(
-        { signature: txId, blockhash, lastValidBlockHeight },
-        'confirmed',
-      );
-
-      if (confirmation.value.err) {
-        throw new Error(
-          `Transaction ${i + 1} failed on-chain: ${JSON.stringify(confirmation.value.err)}`,
-        );
-      }
-
-      this.logger!.debug(`PumpTracks: transaction ${i + 1} confirmed on-chain`);
-    }
-
-    // ── Step 5: Register track on PumpTracks ──
-    // Only sends mint address + tx IDs + track metadata.
-    // PumpTracks verifies the mint exists on-chain before saving.
-    // NO signed transactions are sent to PumpTracks.
-    this.logger!.info('PumpTracks: registering track on PumpTracks...');
-    const result = await this.client!.registerTrack(
-      prepared.mint,
-      txIds,
-      prepared.trackInfo,
-    );
-
-    this.logger!.info(`PumpTracks: track live at ${result.playUrl}`);
-    this.logger!.info(`PumpTracks: tx(s): ${txIds.join(', ')}`);
-
-    return result;
-  }
-
-  // ============================================================================
-  // Security: Transaction validation
-  // ============================================================================
-
-  /**
-   * Validate that every instruction in the transaction targets a program
-   * in the ALLOWED_PROGRAM_IDS allowlist. Refuses to sign if any
-   * instruction targets an unknown program.
-   *
-   * @throws Error if any instruction targets a disallowed program
-   */
-  private validateTransactionPrograms(tx: VersionedTransaction, txIndex: number): void {
-    const message = tx.message;
-    const accountKeys = message.getAccountKeys();
-
-    for (const instruction of message.compiledInstructions) {
-      const programId = accountKeys.get(instruction.programIdIndex);
-      if (!programId) {
-        throw new Error(
-          `Transaction ${txIndex + 1}: instruction references invalid account index ${instruction.programIdIndex}`,
-        );
-      }
-
-      const programIdStr = programId.toBase58();
-      if (!ALLOWED_PROGRAM_IDS.has(programIdStr)) {
-        throw new Error(
-          `Transaction ${txIndex + 1}: disallowed program ${programIdStr}. ` +
-          `Only Raydium LaunchLab, SPL Token, System, Metaplex, and Compute Budget programs are permitted. ` +
-          `This transaction was NOT signed.`,
-        );
-      }
-    }
-
-    this.logger!.debug(
-      `PumpTracks: transaction ${txIndex + 1} passed program allowlist validation ` +
-      `(${message.compiledInstructions.length} instructions)`,
-    );
-  }
-
-  /**
-   * Simulate a transaction before signing to verify it won't fail or
-   * behave unexpectedly.
-   *
-   * @throws Error if simulation returns an error
-   */
-  private async simulateTransaction(tx: VersionedTransaction, txIndex: number): Promise<void> {
-    this.logger!.debug(`PumpTracks: simulating transaction ${txIndex + 1}...`);
-
-    const simulation = await this.connection!.simulateTransaction(tx, {
-      sigVerify: false,
-      replaceRecentBlockhash: true,
+    const raydium = await Raydium.load({
+      connection: this.connection!,
+      owner: this.wallet!.publicKey,
+      signAllTransactions: this.wallet!.signAllTransactions.bind(this.wallet),
+      cluster: 'mainnet',
+      disableFeatureCheck: true,
+      blockhashCommitment: 'finalized',
     });
 
-    if (simulation.value.err) {
-      const logs = simulation.value.logs?.join('\n') || 'no logs';
-      throw new Error(
-        `Transaction ${txIndex + 1} simulation failed: ${JSON.stringify(simulation.value.err)}\nLogs:\n${logs}`,
-      );
+    // Read LaunchLab config from chain
+    const programId = LAUNCHPAD_PROGRAM;
+    const configId = getPdaLaunchpadConfigId(programId, NATIVE_MINT, 0, 0).publicKey;
+    const configData = await this.connection!.getAccountInfo(configId);
+    if (!configData) {
+      throw new Error('Raydium LaunchLab config not found on-chain. Check network/RPC.');
+    }
+    const configInfo = LaunchpadConfig.decode(configData.data);
+
+    const initialBuyLamports = params.initialBuyLamports ?? 50_000_000; // 0.05 SOL
+
+    const { execute } = await raydium.launchpad.createLaunchpad({
+      programId,
+      mintA: mintKeypair.publicKey,
+      decimals: 6,
+      name: params.artist,
+      symbol: uploadResult.symbol,
+      migrateType: 'cpmm',
+      uri: uploadResult.metadataUri,
+      configId,
+      configInfo,
+      mintBDecimals: 9,
+      platformId: new PublicKey(PUMPTRACKS_PLATFORM_ID),
+      txVersion: TxVersion.V0,
+      slippage: new BN(100),
+      buyAmount: new BN(initialBuyLamports),
+      createOnly: false,
+      extraSigners: [mintKeypair],
+      computeBudgetConfig: {
+        microLamports: 100_000,
+      },
+    });
+
+    // ── Step 4: Sign with agent wallet + broadcast to Solana ──
+    this.logger!.info('PumpTracks: signing and broadcasting to Solana...');
+    const result = await execute({ sequentially: true, sendAndConfirm: true });
+    const txIds = result.txIds || [];
+
+    if (txIds.length === 0) {
+      throw new Error('Transaction broadcast returned no tx IDs');
     }
 
-    this.logger!.debug(`PumpTracks: transaction ${txIndex + 1} simulation passed`);
+    this.logger!.info(`PumpTracks: confirmed on-chain, txIds: ${txIds.join(', ')}`);
+
+    // ── Step 5: Register track on PumpTracks ──
+    // Only sends mint address + tx IDs + metadata.
+    // PumpTracks verifies the mint exists on-chain before saving.
+    this.logger!.info('PumpTracks: registering track on PumpTracks...');
+    const registerResult = await this.client!.registerTrack(
+      mintAddress,
+      txIds,
+      {
+        title: params.title,
+        artist: params.artist,
+        genre: params.genre,
+        symbol: uploadResult.symbol,
+        metadataUri: uploadResult.metadataUri,
+        artUri: uploadResult.artUri,
+        trackUri: uploadResult.trackUri,
+        wallet: walletAddress,
+        ...(params.twitter && { twitter: params.twitter }),
+        ...(params.tiktok && { tiktok: params.tiktok }),
+        ...(params.instagram && { instagram: params.instagram }),
+      },
+    );
+
+    this.logger!.info(`PumpTracks: track live at ${registerResult.playUrl}`);
+    return registerResult;
   }
 
   // ============================================================================
   // Security: File path validation
   // ============================================================================
 
-  /**
-   * Validate and load file inputs. When given file paths (strings):
-   * - Resolves to absolute path to prevent traversal
-   * - Checks against blocked path patterns (secrets, keys, etc.)
-   * - Validates file extension against allowed types
-   * - Checks file size against limits
-   *
-   * When given Buffers, validates size only.
-   *
-   * @throws Error on blocked path, wrong extension, or size limit
-   */
   private loadAndValidateFiles(params: MintTrackParams): {
     audioBlob: Blob;
     audioFilename: string;
@@ -472,22 +411,14 @@ export class PumpTracksSkill implements Skill {
     return { audioBlob, audioFilename, artBlob, artFilename };
   }
 
-  /**
-   * Validate a file path and read its contents.
-   *
-   * @throws Error if path matches a blocked pattern, has wrong extension,
-   *         doesn't exist, or exceeds size limit
-   */
   private validateAndReadFile(
     filePath: string,
     allowedExtensions: ReadonlySet<string>,
     maxSize: number,
     label: string,
   ): { buffer: Buffer; filename: string } {
-    // Resolve to absolute path to normalize traversal attempts
     const resolved = path.resolve(filePath);
 
-    // Check against blocked patterns
     for (const pattern of BLOCKED_PATH_PATTERNS) {
       if (pattern.test(resolved)) {
         throw new Error(
@@ -497,7 +428,6 @@ export class PumpTracksSkill implements Skill {
       }
     }
 
-    // Validate extension
     const ext = path.extname(resolved).toLowerCase();
     if (!allowedExtensions.has(ext)) {
       throw new Error(
@@ -505,12 +435,10 @@ export class PumpTracksSkill implements Skill {
       );
     }
 
-    // Check existence
     if (!fs.existsSync(resolved)) {
       throw new Error(`${label} file not found: ${filePath}`);
     }
 
-    // Check size before reading
     const stats = fs.statSync(resolved);
     if (stats.size > maxSize) {
       throw new Error(
@@ -528,12 +456,6 @@ export class PumpTracksSkill implements Skill {
   // Security: Balance guard
   // ============================================================================
 
-  /**
-   * Check that the wallet has enough SOL to cover minting costs
-   * (0.05 SOL initial buy + rent + transaction fees).
-   *
-   * @throws Error if balance is below MIN_MINT_LAMPORTS (0.07 SOL)
-   */
   private async ensureSufficientBalance(): Promise<void> {
     const balance = await this.connection!.getBalance(this.wallet!.publicKey);
     const balanceBigInt = BigInt(balance);

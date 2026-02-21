@@ -92,7 +92,8 @@ export {
   type Track,
   type Artist,
   type MintResult,
-  type PrepareResult,
+  type UploadResult,
+  type TrackInfo,
   PUMPTRACKS_API_BASE_URL,
   DEFAULT_TIMEOUT_MS,
   ALLOWED_AUDIO_EXTENSIONS,
@@ -100,7 +101,7 @@ export {
   MAX_AUDIO_SIZE,
   MAX_ARTWORK_SIZE,
   MIN_MINT_LAMPORTS,
-  ALLOWED_PROGRAM_IDS,
+  PUMPTRACKS_PLATFORM_ID,
   BLOCKED_PATH_PATTERNS,
 } from './pumptracks/index.js';
 

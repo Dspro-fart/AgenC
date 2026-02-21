@@ -25,30 +25,8 @@ export const MAX_ARTWORK_SIZE = 10 * 1024 * 1024;
 /** Minimum SOL required for minting (0.05 SOL initial buy + rent + fees) */
 export const MIN_MINT_LAMPORTS = 70_000_000n; // 0.07 SOL
 
-/**
- * Allowlist of Solana program IDs permitted in PumpTracks mint transactions.
- *
- * Any transaction returned by the PumpTracks API is validated against this
- * list before signing. If a transaction contains an instruction targeting
- * a program NOT in this set, signing is refused.
- */
-export const ALLOWED_PROGRAM_IDS: ReadonlySet<string> = new Set([
-  // Solana system programs
-  '11111111111111111111111111111111',                         // System Program
-  'ComputeBudget111111111111111111111111111111',              // Compute Budget
-  'SysvarRent111111111111111111111111111111111',              // Sysvar Rent
-
-  // SPL Token programs
-  'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',           // Token Program
-  'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb',           // Token-2022
-  'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL',          // Associated Token Program
-
-  // Raydium LaunchLab (mainnet)
-  'LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj',          // LaunchLab Program
-
-  // Metaplex
-  'metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s',           // Token Metadata Program
-]);
+/** PumpTracks platform ID on Raydium LaunchLab (mainnet) */
+export const PUMPTRACKS_PLATFORM_ID = 'EjET1WnDdcqb2vBsAJ6Kdq4mKCTSvzrGHUVhKpEX7K4Q';
 
 /**
  * Sensitive file path patterns that must never be read.

@@ -68,6 +68,8 @@ export interface MintTrackParams {
   tiktok?: string;
   /** Optional Instagram URL */
   instagram?: string;
+  /** Optional initial buy amount in lamports (default: 50_000_000 = 0.05 SOL) */
+  initialBuyLamports?: number;
 }
 
 /**
@@ -135,27 +137,37 @@ export interface MintResult {
 }
 
 /**
- * Intermediate result from the prepare (mint) step.
+ * Result from the upload step — file URIs only, NO transactions.
+ * PumpTracks handles file hosting; the agent builds its own transaction.
  */
-export interface PrepareResult {
-  /** Base64-encoded unsigned VersionedTransaction(s) */
-  transactions: string[];
-  /** Token mint address */
-  mint: string;
-  /** Track info to pass back in submit step */
-  trackInfo: {
-    title: string;
-    artist: string;
-    genre: string;
-    symbol: string;
-    metadataUri: string;
-    artUri: string;
-    trackUri: string;
-    wallet: string;
-    twitter?: string;
-    tiktok?: string;
-    instagram?: string;
-  };
+export interface UploadResult {
+  /** IPFS metadata URI (ipfs://...) */
+  metadataUri: string;
+  /** Firebase Storage artwork URL */
+  artUri: string;
+  /** Firebase Storage audio URL */
+  trackUri: string;
+  /** Generated token symbol */
+  symbol: string;
+  /** PumpTracks platform ID for Raydium LaunchLab */
+  platformId: string;
+}
+
+/**
+ * Track info passed to the /register endpoint after minting.
+ */
+export interface TrackInfo {
+  title: string;
+  artist: string;
+  genre: string;
+  symbol: string;
+  metadataUri: string;
+  artUri: string;
+  trackUri: string;
+  wallet: string;
+  twitter?: string;
+  tiktok?: string;
+  instagram?: string;
 }
 
 /**

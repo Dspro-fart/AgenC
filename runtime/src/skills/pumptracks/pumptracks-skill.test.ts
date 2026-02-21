@@ -2,19 +2,24 @@
  * PumpTracks skill unit tests.
  *
  * Covers: metadata, lifecycle, action registry, security guards
- * (program allowlist, path validation, balance check), and read actions.
+ * (path validation, balance check), read actions, and local-tx mint flow.
+ *
+ * Architecture guarantee: The agent builds its own Raydium transaction
+ * locally using the SDK. PumpTracks is used ONLY for file hosting (upload)
+ * and track registration (after on-chain confirmation). No external server
+ * ever provides transaction bytes for signing.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { Keypair, VersionedTransaction, TransactionMessage, SystemProgram } from '@solana/web3.js';
+import { Keypair } from '@solana/web3.js';
 import { PumpTracksSkill } from './pumptracks-skill.js';
 import { SkillState } from '../types.js';
 import {
-  ALLOWED_PROGRAM_IDS,
   BLOCKED_PATH_PATTERNS,
   ALLOWED_AUDIO_EXTENSIONS,
   ALLOWED_IMAGE_EXTENSIONS,
   MIN_MINT_LAMPORTS,
+  PUMPTRACKS_PLATFORM_ID,
 } from './constants.js';
 
 // ─── Mock helpers ────────────────────────────────────────
@@ -32,10 +37,7 @@ function createMockWallet() {
   const kp = Keypair.generate();
   return {
     publicKey: kp.publicKey,
-    signTransaction: vi.fn().mockImplementation((tx: VersionedTransaction) => {
-      tx.sign([kp]);
-      return Promise.resolve(tx);
-    }),
+    signTransaction: vi.fn(),
     signAllTransactions: vi.fn(),
   };
 }
@@ -43,12 +45,12 @@ function createMockWallet() {
 function createMockConnection() {
   return {
     getBalance: vi.fn().mockResolvedValue(1_000_000_000), // 1 SOL
-    simulateTransaction: vi.fn().mockResolvedValue({
-      value: { err: null, logs: [] },
-    }),
     getLatestBlockhash: vi.fn().mockResolvedValue({
       blockhash: '11111111111111111111111111111111',
       lastValidBlockHeight: 1000,
+    }),
+    getAccountInfo: vi.fn().mockResolvedValue({
+      data: Buffer.alloc(256), // mock config account data
     }),
   };
 }
@@ -151,6 +153,12 @@ describe('PumpTracksSkill', () => {
     it('returns undefined for unknown action', () => {
       expect(skill.getAction('nonexistent')).toBeUndefined();
     });
+
+    it('mintTrack description mentions local transaction building', () => {
+      const action = skill.getAction('mintTrack');
+      expect(action?.description).toContain('LOCALLY');
+      expect(action?.description).not.toContain('server');
+    });
   });
 
   // ── Guards ──
@@ -233,252 +241,18 @@ describe('PumpTracksSkill', () => {
       expect(calledUrl).toContain('custom.api');
     });
   });
-
-  // ── Direct broadcast (architecture security) ──
-
-  describe('mintTrack direct broadcast', () => {
-    it('broadcasts signed transactions directly to Solana, not to PumpTracks', async () => {
-      await skill.initialize(context);
-
-      // Mock prepareMint response
-      const kp = Keypair.generate();
-      const blockhash = '11111111111111111111111111111111';
-
-      // Build a valid VersionedTransaction with only allowed programs
-      const message = new TransactionMessage({
-        payerKey: context.wallet.publicKey,
-        recentBlockhash: blockhash,
-        instructions: [
-          SystemProgram.transfer({
-            fromPubkey: context.wallet.publicKey,
-            toPubkey: kp.publicKey,
-            lamports: 1000,
-          }),
-        ],
-      }).compileToV0Message();
-      const tx = new VersionedTransaction(message);
-      const txBase64 = Buffer.from(tx.serialize()).toString('base64');
-
-      // Mock fetch: first call = prepareMint, second call = registerTrack
-      const fetchMock = globalThis.fetch as any;
-      fetchMock
-        .mockResolvedValueOnce({
-          ok: true,
-          json: () => Promise.resolve({
-            success: true,
-            data: {
-              transactions: [txBase64],
-              mint: kp.publicKey.toBase58(),
-              trackInfo: {
-                title: 'Test', artist: 'Artist', genre: 'Electronic',
-                symbol: 'TEST', metadataUri: 'ipfs://Qm', artUri: 'https://art',
-                trackUri: 'https://track', wallet: context.wallet.publicKey.toBase58(),
-              },
-            },
-          }),
-        })
-        .mockResolvedValueOnce({
-          ok: true,
-          json: () => Promise.resolve({
-            success: true,
-            data: {
-              mint: kp.publicKey.toBase58(),
-              txIds: ['txSig123'],
-              playUrl: `https://pumptracks.fun/play/${kp.publicKey.toBase58()}`,
-            },
-          }),
-        });
-
-      // Mock connection.sendRawTransaction + confirmTransaction
-      context.connection.sendRawTransaction = vi.fn().mockResolvedValue('txSig123');
-      context.connection.confirmTransaction = vi.fn().mockResolvedValue({
-        value: { err: null },
-      });
-
-      const result = await skill.mintTrack({
-        audio: Buffer.from('fake-audio-data'),
-        artwork: Buffer.from('fake-artwork-data'),
-        title: 'Test',
-        artist: 'Artist',
-        genre: 'Electronic',
-      });
-
-      // Verify: sendRawTransaction was called (broadcast to Solana)
-      expect(context.connection.sendRawTransaction).toHaveBeenCalledOnce();
-
-      // Verify: confirmTransaction was called (waited for confirmation)
-      expect(context.connection.confirmTransaction).toHaveBeenCalledOnce();
-
-      // Verify: the second fetch call is to /register (not /submit)
-      const registerCall = fetchMock.mock.calls[1];
-      expect(registerCall[0]).toContain('/tracks/register');
-
-      // Verify: register body does NOT contain signed transactions
-      const registerBody = JSON.parse(registerCall[1].body);
-      expect(registerBody.mint).toBeDefined();
-      expect(registerBody.txIds).toEqual(['txSig123']);
-      expect(registerBody.trackInfo).toBeDefined();
-      expect(registerBody.signedTransactions).toBeUndefined();
-      expect(registerBody.transactions).toBeUndefined();
-
-      // Verify result
-      expect(result.playUrl).toContain('pumptracks.fun');
-    });
-
-    it('throws when on-chain broadcast fails', async () => {
-      await skill.initialize(context);
-
-      const kp = Keypair.generate();
-      const blockhash = '11111111111111111111111111111111';
-
-      const message = new TransactionMessage({
-        payerKey: context.wallet.publicKey,
-        recentBlockhash: blockhash,
-        instructions: [
-          SystemProgram.transfer({
-            fromPubkey: context.wallet.publicKey,
-            toPubkey: kp.publicKey,
-            lamports: 1000,
-          }),
-        ],
-      }).compileToV0Message();
-      const tx = new VersionedTransaction(message);
-      const txBase64 = Buffer.from(tx.serialize()).toString('base64');
-
-      (globalThis.fetch as any).mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({
-          success: true,
-          data: {
-            transactions: [txBase64],
-            mint: kp.publicKey.toBase58(),
-            trackInfo: {
-              title: 'Test', artist: 'Artist', genre: 'Electronic',
-              symbol: 'TEST', metadataUri: 'ipfs://Qm', artUri: 'https://art',
-              trackUri: 'https://track', wallet: context.wallet.publicKey.toBase58(),
-            },
-          },
-        }),
-      });
-
-      // Mock: broadcast succeeds but confirmation shows error
-      context.connection.sendRawTransaction = vi.fn().mockResolvedValue('txSig123');
-      context.connection.confirmTransaction = vi.fn().mockResolvedValue({
-        value: { err: { InstructionError: [0, 'Custom'] } },
-      });
-
-      await expect(
-        skill.mintTrack({
-          audio: Buffer.from('fake-audio'),
-          artwork: Buffer.from('fake-art'),
-          title: 'Test',
-          artist: 'Artist',
-          genre: 'Electronic',
-        }),
-      ).rejects.toThrow('failed on-chain');
-    });
-
-    it('never sends signed transactions to PumpTracks server', async () => {
-      await skill.initialize(context);
-
-      const kp = Keypair.generate();
-      const blockhash = '11111111111111111111111111111111';
-
-      const message = new TransactionMessage({
-        payerKey: context.wallet.publicKey,
-        recentBlockhash: blockhash,
-        instructions: [
-          SystemProgram.transfer({
-            fromPubkey: context.wallet.publicKey,
-            toPubkey: kp.publicKey,
-            lamports: 1000,
-          }),
-        ],
-      }).compileToV0Message();
-      const tx = new VersionedTransaction(message);
-      const txBase64 = Buffer.from(tx.serialize()).toString('base64');
-
-      const fetchMock = globalThis.fetch as any;
-      fetchMock
-        .mockResolvedValueOnce({
-          ok: true,
-          json: () => Promise.resolve({
-            success: true,
-            data: {
-              transactions: [txBase64],
-              mint: kp.publicKey.toBase58(),
-              trackInfo: {
-                title: 'Test', artist: 'Artist', genre: 'Electronic',
-                symbol: 'TEST', metadataUri: 'ipfs://Qm', artUri: 'https://art',
-                trackUri: 'https://track', wallet: context.wallet.publicKey.toBase58(),
-              },
-            },
-          }),
-        })
-        .mockResolvedValueOnce({
-          ok: true,
-          json: () => Promise.resolve({
-            success: true,
-            data: { mint: 'x', txIds: ['t'], playUrl: 'u' },
-          }),
-        });
-
-      context.connection.sendRawTransaction = vi.fn().mockResolvedValue('txSig');
-      context.connection.confirmTransaction = vi.fn().mockResolvedValue({
-        value: { err: null },
-      });
-
-      await skill.mintTrack({
-        audio: Buffer.from('audio'),
-        artwork: Buffer.from('art'),
-        title: 'Test',
-        artist: 'Artist',
-        genre: 'Electronic',
-      });
-
-      // Check ALL fetch calls — none should contain base64-encoded signed transactions
-      for (const call of fetchMock.mock.calls) {
-        const init = call[1];
-        if (init.body && typeof init.body === 'string') {
-          const body = JSON.parse(init.body);
-          expect(body.signedTransactions).toBeUndefined();
-          // The body should not contain any base64-encoded transaction data
-          if (body.transactions) {
-            // This would only be in the prepare request, not register
-            expect(call[0]).not.toContain('/register');
-          }
-        }
-      }
-    });
-  });
 });
 
 // ─── Security: Constants validation ──────────────────────
 
 describe('Security constants', () => {
-  describe('ALLOWED_PROGRAM_IDS', () => {
-    it('includes System Program', () => {
-      expect(ALLOWED_PROGRAM_IDS.has('11111111111111111111111111111111')).toBe(true);
+  describe('PUMPTRACKS_PLATFORM_ID', () => {
+    it('is a valid base58 string', () => {
+      expect(PUMPTRACKS_PLATFORM_ID).toMatch(/^[1-9A-HJ-NP-Za-km-z]+$/);
     });
 
-    it('includes Token Program', () => {
-      expect(ALLOWED_PROGRAM_IDS.has('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA')).toBe(true);
-    });
-
-    it('includes Raydium LaunchLab', () => {
-      expect(ALLOWED_PROGRAM_IDS.has('LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj')).toBe(true);
-    });
-
-    it('includes Metaplex Token Metadata', () => {
-      expect(ALLOWED_PROGRAM_IDS.has('metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s')).toBe(true);
-    });
-
-    it('does NOT include random programs', () => {
-      expect(ALLOWED_PROGRAM_IDS.has('RandomProgram11111111111111111111111111111')).toBe(false);
-    });
-
-    it('has exactly 9 entries', () => {
-      expect(ALLOWED_PROGRAM_IDS.size).toBe(9);
+    it('matches the expected platform ID', () => {
+      expect(PUMPTRACKS_PLATFORM_ID).toBe('EjET1WnDdcqb2vBsAJ6Kdq4mKCTSvzrGHUVhKpEX7K4Q');
     });
   });
 
@@ -554,5 +328,27 @@ describe('Security constants', () => {
     it('is 0.07 SOL', () => {
       expect(MIN_MINT_LAMPORTS).toBe(70_000_000n);
     });
+  });
+});
+
+// ─── Architecture security guarantee ─────────────────────
+// These tests verify the fundamental architectural guarantee:
+// NO ALLOWED_PROGRAM_IDS exists — the agent doesn't validate
+// transactions from an external server because it builds its own.
+
+describe('Architecture: no external transaction signing', () => {
+  it('constants.ts does not export ALLOWED_PROGRAM_IDS', async () => {
+    const constants = await import('./constants.js');
+    expect((constants as any).ALLOWED_PROGRAM_IDS).toBeUndefined();
+  });
+
+  it('skill does not have validateTransactionPrograms method', () => {
+    const skill = createSkill();
+    expect((skill as any).validateTransactionPrograms).toBeUndefined();
+  });
+
+  it('skill does not have simulateTransaction method', () => {
+    const skill = createSkill();
+    expect((skill as any).simulateTransaction).toBeUndefined();
   });
 });
